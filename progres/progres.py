@@ -31,7 +31,7 @@ dropout = 0.0
 dropout_final = 0.0
 default_minsimilarity = 0.8
 default_maxhits = 100
-pre_embedded_dbs = ["scope95", "scope40", "cath40", "ecod70", "pdb100", "af21org"]
+pre_embedded_dbs = ["scope95", "scope40", "cath40", "ecod70", "pdb100", "af21org", "ark_scope40_CIRPIN_embed_1_7_25"]
 pre_embedded_dbs_faiss = ["afted"]
 zenodo_record = "13365312" # This only needs to change when the trained model or databases change
 trained_model_subdir = "v_0_2_0" # This only needs to change when the trained model changes
@@ -41,7 +41,7 @@ progres_dir       = os.path.dirname(os.path.realpath(__file__))
 data_dir          = os.getenv("PROGRES_DATA_DIR", default=progres_dir)
 trained_model_dir = os.path.join(data_dir, "trained_models", trained_model_subdir)
 database_dir      = os.path.join(data_dir, "databases"     , database_subdir     )
-trained_model_fp  = os.path.join(trained_model_dir, "trained_model.pt")
+trained_model_fp  = os.path.join(trained_model_dir, "CIRPIN_model_5k_cp_epoch301.pt")
 chainsaw_dir      = os.path.join(data_dir, "chainsaw", "model_v3")
 chainsaw_model_fp = os.path.join(chainsaw_dir, "weights.pt")
 
@@ -406,10 +406,10 @@ def embedding_similarity(emb_1, emb_2):
     cosine_dist = (emb_1 * emb_2).sum(dim=-1) # Normalised in the model
     return (1 + cosine_dist) / 2 # Runs 0 (far) to 1 (close)
 
-def load_trained_model(device="cpu"):
+def load_trained_model(model_file, device="cpu"):
     download_data_if_required()
     model = Model().to(device)
-    loaded_model = torch.load(trained_model_fp, map_location=device)
+    loaded_model = torch.load(model_file, map_location=device)
     model.load_state_dict(loaded_model["model"])
     model.eval()
     return model
@@ -508,7 +508,7 @@ def download_data_if_required(download_afted=False):
         print("Data downloaded successfully", file=sys.stderr)
 
 def progres_search_generator(querystructure=None, querylist=None, queryembeddings=None,
-                             targetdb=None, fileformat="guess", minsimilarity=default_minsimilarity,
+                             targetdb=None, model_file="CIRPIN_model_5k_cp_epoch301.pt", fileformat="guess", minsimilarity=default_minsimilarity,
                              maxhits=default_maxhits, chainsaw=False, device="cpu",
                              batch_size=None):
     if querystructure is None and querylist is None and queryembeddings is None:
@@ -534,7 +534,7 @@ def progres_search_generator(querystructure=None, querylist=None, queryembedding
         target_index = None
         search_type = "torch"
 
-    model = load_trained_model(device)
+    model = load_trained_model(model_file, device)
     if querystructure is not None:
         query_fps = [querystructure]
         data_set = StructureDataset(query_fps, fileformat, model, device, chainsaw)
@@ -628,11 +628,11 @@ def progres_search(querystructure=None, querylist=None, queryembeddings=None, ta
     return list(generator)
 
 def progres_search_print(querystructure=None, querylist=None, queryembeddings=None, targetdb=None,
-                         fileformat="guess", minsimilarity=default_minsimilarity,
+                         model_file="CIRPIN_model_5k_cp_epoch301.pt", fileformat="guess", minsimilarity=default_minsimilarity,
                          maxhits=default_maxhits, chainsaw=False, device="cpu", batch_size=None):
     generator = progres_search_generator(querystructure, querylist, queryembeddings, targetdb,
-                                         fileformat, minsimilarity, maxhits, chainsaw, device,
-                                         batch_size)
+                                         model_file, fileformat, minsimilarity, maxhits, chainsaw,
+                                         device, batch_size)
     version = importlib.metadata.version("progres")
 
     for rd in generator:
@@ -670,21 +670,21 @@ def progres_search_print(querystructure=None, querylist=None, queryembeddings=No
             ]))
         print()
 
-def progres_score(structure1, structure2, fileformat1="guess", fileformat2="guess", device="cpu"):
+def progres_score(structure1, structure2, fileformat1="guess", fileformat2="guess", model_file="CIRPIN_model_5k_cp_epoch301.pt", device="cpu"):
     download_data_if_required()
-    model = load_trained_model(device)
+    model = load_trained_model(model_file, device)
     embedding1 = embed_structure(structure1, fileformat=fileformat1, device=device, model=model)
     embedding2 = embed_structure(structure2, fileformat=fileformat2, device=device, model=model)
     score = embedding_similarity(embedding1, embedding2)
     return score.item()
 
 def progres_score_print(structure1, structure2, fileformat1="guess",
-                        fileformat2="guess", device="cpu"):
-    score = progres_score(structure1, structure2, fileformat1, fileformat2, device)
+                        fileformat2="guess", model_file="CIRPIN_model_5k_cp_epoch301.pt", device="cpu"):
+    score = progres_score(structure1, structure2, fileformat1, fileformat2, model_file, device)
     print(score)
 
-def progres_embed(structurelist, outputfile, fileformat="guess", device="cpu",
-                  batch_size=None, float_type=torch.float16):
+def progres_embed(structurelist, outputfile, fileformat="guess", model_file="CIRPIN_model_5k_cp_epoch301.pt",
+                device="cpu", batch_size=None, float_type=torch.float16):
     download_data_if_required()
 
     fps, domids, notes = [], [], []
@@ -695,7 +695,7 @@ def progres_embed(structurelist, outputfile, fileformat="guess", device="cpu",
             domids.append(cols[1])
             notes.append(cols[2] if len(cols) > 2 else "-")
 
-    model = load_trained_model(device)
+    model = load_trained_model(model_file, device)
     data_set = StructureDataset(fps, fileformat, model, device)
     if batch_size is None:
         batch_size = get_batch_size(device)
