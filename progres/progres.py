@@ -15,6 +15,7 @@ import os
 import re
 import sys
 from urllib import request
+from tqdm import tqdm
 
 from progres.chainsaw.get_predictions import predict_domains
 
@@ -31,7 +32,8 @@ dropout = 0.0
 dropout_final = 0.0
 default_minsimilarity = 0.8
 default_maxhits = 100
-pre_embedded_dbs = ["scope95", "scope40", "cath40", "ecod70", "pdb100", "af21org", "ark_scope40_CIRPIN_embed_1_7_25"]
+model_names = ["trained_model", "CIRPIN_model_5k_cp_epoch301"]
+pre_embedded_dbs = ["scope95", "scope40", "cath40", "ecod70", "pdb100", "af21org", "ark_scope40_CIRPIN_embed_1_7_25", "pdb_max384"]
 pre_embedded_dbs_faiss = ["afted"]
 zenodo_record = "13365312" # This only needs to change when the trained model or databases change
 trained_model_subdir = "v_0_2_0" # This only needs to change when the trained model changes
@@ -215,6 +217,8 @@ def get_file_format(fp, fileformat):
             chosen_format = "mmcif"
         elif file_ext == ".mmtf":
             chosen_format = "mmtf"
+        elif file_ext == ".pt":
+            chosen_format = "pt"
     else:
         chosen_format = fileformat
     return chosen_format
@@ -255,11 +259,25 @@ class StructureDataset(Dataset):
         return len(self.file_paths)
 
     def __getitem__(self, idx):
-        res_range = None if self.res_ranges[idx] == "all" else self.res_ranges[idx]
-        graph = read_graph(self.file_paths[idx], self.fileformat, res_range)
-        emb = self.model(graph.to(self.device)).squeeze(0)
-        nres = graph.num_nodes
-        return emb, nres, self.query_nums[idx], self.domain_nums[idx], self.res_ranges[idx]
+        try:
+            res_range = None if self.res_ranges[idx] == "all" else self.res_ranges[idx]
+            graph = read_graph(self.file_paths[idx], self.fileformat, res_range)
+            emb = self.model(graph.to(self.device)).squeeze(0)
+            nres = graph.num_nodes
+            return emb, nres, self.query_nums[idx], self.domain_nums[idx], self.res_ranges[idx]
+        except ValueError as e:
+            # Check if this is a "too short" error
+            if "Protein too short" in str(e):
+                print(f"Warning: Skipping file {idx+1}/{len(self.file_paths)} '{self.file_paths[idx]}': {str(e)}", file=sys.stderr)
+                # Return a dummy embedding for this file - it will be filtered out later
+                dummy_emb = torch.zeros(embedding_size, device=self.device)
+                return dummy_emb, 0, self.query_nums[idx], self.domain_nums[idx], self.res_ranges[idx]
+            else:
+                # Re-raise other ValueError exceptions
+                raise type(e)(f"Error processing file {idx+1}/{len(self.file_paths)} '{self.file_paths[idx]}': {str(e)}") from e
+        except Exception as e:
+            # Add context about which file failed
+            raise type(e)(f"Error processing file {idx+1}/{len(self.file_paths)} '{self.file_paths[idx]}': {str(e)}") from e
 
 class EmbeddingDataset(Dataset):
     def __init__(self, embeddings):
@@ -339,6 +357,9 @@ def read_coords(fp, fileformat="guess", res_range=None):
                                     coords.append([float(cs[0]), float(cs[1]), float(cs[2])])
                 break # Only read first chain
             break # Only read first model
+    elif chosen_format == "pt":
+        data = torch.load(fp)
+        coords = data["coords"][:, 1, :]
     elif chosen_format == "coords":
         with open(fp) as f:
             c = 0
@@ -360,6 +381,11 @@ def coords_to_graph(coords):
         coords = torch.tensor(coords)
     if coords.size(1) != 3:
         raise ValueError("coords must be, or must be convertible to, a tensor of shape (nres, 3)")
+    
+    # Check if protein is too short for tau angle calculation
+    if n_res < 4:
+        raise ValueError(f"Protein too short for tau angle calculation: {n_res} residues (minimum 4 required)")
+    
     dmap = torch.cdist(coords.unsqueeze(0), coords.unsqueeze(0),
                        compute_mode="donot_use_mm_for_euclid_dist")
     contacts = (dmap <= contact_dist).squeeze(0)
@@ -383,20 +409,51 @@ def coords_to_graph(coords):
         (torch.cross(cross_ab_bc, cross_bc_cd, dim=1) * normalize(vec_bc, dim=1)).sum(dim=1),
         (cross_ab_bc * cross_bc_cd).sum(dim=1),
     )
+    
+    # Debug: Check tensor shapes before concatenation
+    expected_taus_length = n_res - 3
+    actual_taus_length = len(taus)
+    if actual_taus_length != expected_taus_length:
+        raise ValueError(f"Tau angle calculation error: expected {expected_taus_length} angles for {n_res} residues, got {actual_taus_length}")
+    
     taus_pad = torch.cat((
         torch.tensor([0.0]),
         taus / torch.pi, # Convert to range -1 -> 1
         torch.tensor([0.0, 0.0]),
     )).unsqueeze(1)
+    
+    # Debug: Check final tensor shapes before concatenation
+    expected_taus_pad_length = n_res
+    actual_taus_pad_length = len(taus_pad)
+    if actual_taus_pad_length != expected_taus_pad_length:
+        raise ValueError(f"Tau padding error: expected {expected_taus_pad_length} elements, got {actual_taus_pad_length}")
 
     pos_embed = pos_embedder(torch.arange(1, n_res + 1))
+    
+    # Debug: Check all tensor shapes before final concatenation
+    tensor_shapes = {
+        'norm_degrees': norm_degrees.shape,
+        'term_features': term_features.shape, 
+        'taus_pad': taus_pad.shape,
+        'pos_embed': pos_embed.shape
+    }
+    
+    # Verify all tensors have the same first dimension (n_res)
+    first_dims = [shape[0] for shape in tensor_shapes.values()]
+    if len(set(first_dims)) != 1:
+        raise ValueError(f"Tensor dimension mismatch in coords_to_graph: {tensor_shapes}")
+    
     x = torch.cat((norm_degrees, term_features, taus_pad, pos_embed), dim=1)
     data = Data(x=x, edge_index=edge_index, coords=coords)
     return data
 
 def read_graph(fp, fileformat="guess", res_range=None):
-    coords = read_coords(fp, fileformat, res_range)
-    return coords_to_graph(coords)
+    try:
+        coords = read_coords(fp, fileformat, res_range)
+        return coords_to_graph(coords)
+    except Exception as e:
+        # Add file path context to the error
+        raise type(e)(f"Error processing file '{fp}': {str(e)}") from e
 
 def embedding_distance(emb_1, emb_2):
     cosine_dist = (emb_1 * emb_2).sum(dim=-1) # Normalised in the model
@@ -406,10 +463,10 @@ def embedding_similarity(emb_1, emb_2):
     cosine_dist = (emb_1 * emb_2).sum(dim=-1) # Normalised in the model
     return (1 + cosine_dist) / 2 # Runs 0 (far) to 1 (close)
 
-def load_trained_model(model_file, device="cpu"):
-    download_data_if_required()
+def load_trained_model(model_name, device="cpu"):
+    # download_data_if_required()
     model = Model().to(device)
-    loaded_model = torch.load(model_file, map_location=device)
+    loaded_model = torch.load(os.path.join(trained_model_dir, model_name + ".pt"), map_location=device)
     model.load_state_dict(loaded_model["model"])
     model.eval()
     return model
@@ -447,9 +504,12 @@ def get_num_workers(device="cpu"):
 
 def download_data_if_required(download_afted=False):
     url_base = f"https://zenodo.org/record/{zenodo_record}/files"
-    fps = [trained_model_fp, chainsaw_model_fp]
+    fps = [chainsaw_model_fp]
     chainsaw_model_url = "https://github.com/JudeWells/chainsaw/raw/main/saved_models/model_v3/weights.pt"
-    urls = [f"{url_base}/trained_model.pt", chainsaw_model_url]
+    urls = [chainsaw_model_url]
+    for model_name in model_names:
+        urls.append(f"{url_base}/{model_name}.pt")
+        fps.append(os.path.join(trained_model_dir, model_name + ".pt"))
     for targetdb in pre_embedded_dbs:
         fps.append(os.path.join(database_dir, targetdb + ".pt"))
         urls.append(f"{url_base}/{targetdb}.pt")
@@ -508,7 +568,7 @@ def download_data_if_required(download_afted=False):
         print("Data downloaded successfully", file=sys.stderr)
 
 def progres_search_generator(querystructure=None, querylist=None, queryembeddings=None,
-                             targetdb=None, model_file="CIRPIN_model_5k_cp_epoch301.pt", fileformat="guess", minsimilarity=default_minsimilarity,
+                             targetdb=None, model_name="CIRPIN_model_5k_cp_epoch301", fileformat="guess", minsimilarity=default_minsimilarity,
                              maxhits=default_maxhits, chainsaw=False, device="cpu",
                              batch_size=None):
     if querystructure is None and querylist is None and queryembeddings is None:
@@ -516,7 +576,7 @@ def progres_search_generator(querystructure=None, querylist=None, queryembedding
     if targetdb is None:
         raise ValueError("targetdb must be given")
 
-    download_data_if_required(targetdb == "afted")
+    # download_data_if_required(targetdb == "afted")
 
     if targetdb in pre_embedded_dbs_faiss:
         import faiss
@@ -534,7 +594,7 @@ def progres_search_generator(querystructure=None, querylist=None, queryembedding
         target_index = None
         search_type = "torch"
 
-    model = load_trained_model(model_file, device)
+    model = load_trained_model(model_name, device)
     if querystructure is not None:
         query_fps = [querystructure]
         data_set = StructureDataset(query_fps, fileformat, model, device, chainsaw)
@@ -628,10 +688,10 @@ def progres_search(querystructure=None, querylist=None, queryembeddings=None, ta
     return list(generator)
 
 def progres_search_print(querystructure=None, querylist=None, queryembeddings=None, targetdb=None,
-                         model_file="CIRPIN_model_5k_cp_epoch301.pt", fileformat="guess", minsimilarity=default_minsimilarity,
+                         model_name="CIRPIN_model_5k_cp_epoch301", fileformat="guess", minsimilarity=default_minsimilarity,
                          maxhits=default_maxhits, chainsaw=False, device="cpu", batch_size=None):
     generator = progres_search_generator(querystructure, querylist, queryembeddings, targetdb,
-                                         model_file, fileformat, minsimilarity, maxhits, chainsaw,
+                                         model_name, fileformat, minsimilarity, maxhits, chainsaw,
                                          device, batch_size)
     version = importlib.metadata.version("progres")
 
@@ -670,22 +730,22 @@ def progres_search_print(querystructure=None, querylist=None, queryembeddings=No
             ]))
         print()
 
-def progres_score(structure1, structure2, fileformat1="guess", fileformat2="guess", model_file="CIRPIN_model_5k_cp_epoch301.pt", device="cpu"):
-    download_data_if_required()
-    model = load_trained_model(model_file, device)
+def progres_score(structure1, structure2, fileformat1="guess", fileformat2="guess", model_name="CIRPIN_model_5k_cp_epoch301", device="cpu"):
+    # download_data_if_required()
+    model = load_trained_model(model_name, device)
     embedding1 = embed_structure(structure1, fileformat=fileformat1, device=device, model=model)
     embedding2 = embed_structure(structure2, fileformat=fileformat2, device=device, model=model)
     score = embedding_similarity(embedding1, embedding2)
     return score.item()
 
 def progres_score_print(structure1, structure2, fileformat1="guess",
-                        fileformat2="guess", model_file="CIRPIN_model_5k_cp_epoch301.pt", device="cpu"):
-    score = progres_score(structure1, structure2, fileformat1, fileformat2, model_file, device)
+                        fileformat2="guess", model_name="CIRPIN_model_5k_cp_epoch301", device="cpu"):
+    score = progres_score(structure1, structure2, fileformat1, fileformat2, model_name, device)
     print(score)
 
-def progres_embed(structurelist, outputfile, fileformat="guess", model_file="CIRPIN_model_5k_cp_epoch301.pt",
+def progres_embed(structurelist, outputfile, fileformat="guess", model_name="CIRPIN_model_5k_cp_epoch301",
                 device="cpu", batch_size=None, float_type=torch.float16):
-    download_data_if_required()
+    # download_data_if_required()
 
     fps, domids, notes = [], [], []
     with open(structurelist) as f:
@@ -695,7 +755,7 @@ def progres_embed(structurelist, outputfile, fileformat="guess", model_file="CIR
             domids.append(cols[1])
             notes.append(cols[2] if len(cols) > 2 else "-")
 
-    model = load_trained_model(model_file, device)
+    model = load_trained_model(model_name, device)
     data_set = StructureDataset(fps, fileformat, model, device)
     if batch_size is None:
         batch_size = get_batch_size(device)
@@ -709,16 +769,152 @@ def progres_embed(structurelist, outputfile, fileformat="guess", model_file="CIR
     with torch.no_grad():
         embeddings = torch.zeros(len(data_set), embedding_size, device=device)
         n_residues = torch.zeros(len(data_set), dtype=torch.int, device=device)
-        for bi, (embs, nress, _, _, _) in enumerate(data_loader):
-            embeddings[(bi * batch_size):(bi * batch_size + embs.size(0))] = embs
-            n_residues[(bi * batch_size):(bi * batch_size + embs.size(0))] = nress
+        valid_indices = []  # Track which files were successfully processed
+        
+        for bi, (embs, nress, _, _, _) in tqdm(enumerate(data_loader), total=len(data_loader), desc="Embedding structures"):
+            batch_start = bi * batch_size
+            batch_end = batch_start + embs.size(0)
+            
+            for i in range(embs.size(0)):
+                global_idx = batch_start + i
+                # Check if this is a valid embedding (not a dummy from skipped files)
+                if nress[i] > 0:  # Valid file
+                    embeddings[global_idx] = embs[i]
+                    n_residues[global_idx] = nress[i]
+                    valid_indices.append(global_idx)
+                # Skip dummy embeddings (nres == 0)
+
+    # Filter out dummy embeddings and corresponding metadata
+    valid_embeddings = embeddings[valid_indices]
+    valid_n_residues = n_residues[valid_indices]
+    valid_domids = [domids[i] for i in valid_indices]
+    valid_notes = [notes[i] for i in valid_indices]
+
+    print(f"Successfully embedded {len(valid_indices)} out of {len(data_set)} files", file=sys.stderr)
 
     torch.save(
         {
-            "ids"       : domids,
-            "embeddings": embeddings.cpu().to(float_type),
-            "nres"      : list(n_residues.cpu().numpy()),
-            "notes"     : notes,
+            "ids"       : valid_domids,
+            "embeddings": valid_embeddings.cpu().to(float_type),
+            "nres"      : list(valid_n_residues.cpu().numpy()),
+            "notes"     : valid_notes,
         },
         outputfile,
     )
+
+def validate_structure_file(file_path, fileformat="guess", res_range=None):
+    """
+    Validate a structure file to check if it can be processed by progres.
+    
+    Args:
+        file_path: Path to the structure file
+        fileformat: File format ("guess", "pdb", "mmcif", "mmtf", "coords")
+        res_range: Optional residue range filter
+        
+    Returns:
+        dict: Validation results with status and details
+    """
+    try:
+        # Check if file exists
+        if not os.path.exists(file_path):
+            return {
+                "status": "error",
+                "message": f"File does not exist: {file_path}",
+                "file_path": file_path
+            }
+        
+        # Try to read coordinates
+        coords = read_coords(file_path, fileformat, res_range)
+        
+        if len(coords) == 0:
+            return {
+                "status": "error", 
+                "message": "No Cα coordinates found in file",
+                "file_path": file_path,
+                "n_residues": 0
+            }
+        
+        # Check if protein is too short
+        if len(coords) < 4:
+            return {
+                "status": "error",
+                "message": f"Protein too short: {len(coords)} residues (minimum 4 required for tau angle calculation)",
+                "file_path": file_path,
+                "n_residues": len(coords)
+            }
+        
+        # Try to create graph
+        graph = coords_to_graph(coords)
+        
+        return {
+            "status": "success",
+            "message": f"File validated successfully",
+            "file_path": file_path,
+            "n_residues": len(coords),
+            "n_nodes": graph.num_nodes,
+            "n_edges": graph.edge_index.size(1)
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "file_path": file_path
+        }
+
+def progres_validate(file=None, filelist=None, fileformat="guess"):
+    """
+    Validate structure files to check if they can be processed by progres.
+    
+    Args:
+        file: Single structure file to validate
+        filelist: Text file with one structure file path per line
+        fileformat: File format to use
+    """
+    if file is None and filelist is None:
+        raise ValueError("Either file or filelist must be provided")
+    
+    files_to_validate = []
+    
+    if file:
+        files_to_validate.append(file)
+    
+    if filelist:
+        with open(filelist, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    # Parse the line format: filepath domain_name optional_note
+                    parts = line.split(None, 2)  # Split into max 3 parts
+                    if len(parts) >= 1:
+                        file_path = parts[0]
+                        files_to_validate.append(file_path)
+    
+    print(f"Validating {len(files_to_validate)} files...")
+    print()
+    
+    valid_count = 0
+    error_count = 0
+    
+    for i, file_path in enumerate(files_to_validate, 1):
+        result = validate_structure_file(file_path, fileformat)
+        
+        if result["status"] == "success":
+            print(f"[{i:4d}] ✓ {file_path}")
+            print(f"      Residues: {result['n_residues']}, Nodes: {result['n_nodes']}, Edges: {result['n_edges']}")
+            valid_count += 1
+        else:
+            print(f"[{i:4d}] ✗ {file_path}")
+            print(f"      Error: {result['message']}")
+            error_count += 1
+        
+        print()
+    
+    print(f"Validation complete: {valid_count} valid, {error_count} errors")
+    
+    if error_count > 0:
+        print(f"\nWarning: {error_count} files have issues and may fail during embedding.")
+        return False
+    else:
+        print(f"\nAll files are valid and ready for processing.")
+        return True

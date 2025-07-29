@@ -83,8 +83,26 @@ parser_embed.add_argument("-f", "--fileformat",
     help="file format of the structures, by default guessed from the file extension")
 parser_embed.add_argument("-z", "--model", default="CIRPIN_model_5k_cp_epoch301",
     help="model to use for embedding, default is \"CIRPIN_model_5k_cp_epoch301\"")
+parser_embed.add_argument("-b", "--batch_size", type=int, default=None,
+    help="batch size to use for embedding, default is None")
 parser_embed.add_argument("-d", "--device", default="cpu",
     help="device to run on, default is \"cpu\"")
+
+parser_validate = subparsers.add_parser("validate",
+    description=(
+        "Validate structure files to check if they can be processed by progres. "
+        "Useful for identifying problematic files before embedding. "
+        "See https://github.com/greener-group/progres for documentation and citation information. "
+        f"This is version {importlib.metadata.version('progres')} of the software."
+    ),
+    help="validate structure files to check if they can be processed")
+parser_validate.add_argument("-f", "--file",
+    help="single structure file to validate")
+parser_validate.add_argument("-l", "--filelist",
+    help="text file with one structure file path per line to validate")
+parser_validate.add_argument("-t", "--fileformat",
+    choices=["guess", "pdb", "mmcif", "mmtf", "coords"], default="guess",
+    help="file format of the structures, by default guessed from the file extension")
 
 args = parser.parse_args()
 
@@ -96,11 +114,11 @@ def main():
         if args.maxhits < 1:
             raise argparse.ArgumentTypeError("maxhits must be a positive integer")
         if args.querystructure:
-            progres_search_print(querystructure=args.querystructure, targetdb=args.targetdb, model_file=args.model,
+            progres_search_print(querystructure=args.querystructure, targetdb=args.targetdb, model_name=args.model,
                                  fileformat=args.fileformat, minsimilarity=args.minsimilarity,
                                  maxhits=args.maxhits, chainsaw=args.chainsaw, device=args.device)
         elif args.querylist:
-            progres_search_print(querylist=args.querylist, targetdb=args.targetdb, model_file=args.model,
+            progres_search_print(querylist=args.querylist, targetdb=args.targetdb, model_name=args.model,
                                  fileformat=args.fileformat, minsimilarity=args.minsimilarity,
                                  maxhits=args.maxhits, chainsaw=args.chainsaw, device=args.device)
         else:
@@ -109,11 +127,15 @@ def main():
         from progres import progres_score_print
         progres_score_print(structure1=args.structure1, structure2=args.structure2,
                             fileformat1=args.fileformat1, fileformat2=args.fileformat2,
-                            model_file=args.model, device=args.device)
+                            model_name=args.model, device=args.device)
     elif args.mode == "embed":
         from progres import progres_embed
         progres_embed(structurelist=args.structurelist, outputfile=args.outputfile,
-                      fileformat=args.fileformat, model_file=args.model, device=args.device)
+                      fileformat=args.fileformat, model_name=args.model, device=args.device,
+                      batch_size=args.batch_size)
+    elif args.mode == "validate":
+        from progres import progres_validate
+        progres_validate(file=args.file, filelist=args.filelist, fileformat=args.fileformat)
     else:
         print("No mode selected, run \"progres -h\" to see help", file=sys.stderr)
 
